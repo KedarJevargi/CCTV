@@ -201,19 +201,29 @@ if workflow_mode == "Query by Image":
         st.markdown("---")
         st.subheader("Step 2: Identification & Evidence")
 
-        col_btn, col_thresh = st.columns([1, 2])
+        col_btn, col_thresh, col_filter = st.columns([1, 2, 2])
         with col_thresh:
             threshold = st.slider("Cosine Similarity Threshold:", min_value=0.50, max_value=0.85, value=config.DEFAULT_MATCH_THRESHOLD, step=0.01)
+        with col_filter:
+            all_cams = list(config.CAMERA_VIDEOS.keys())
+            camera_filter = st.multiselect(
+                "Filter cameras:",
+                options=all_cams,
+                default=all_cams,
+                help="Restrict search to specific cameras. All selected by default."
+            )
         with col_btn:
             run_query = st.button("🔍 Search Person in Qdrant", type="primary")
 
+        num_cameras = len(config.CAMERA_VIDEOS)
         if run_query:
             with st.spinner("Extracting OSNet 512-dim embedding and querying Qdrant..."):
                 query_result = matcher.query_crop(
                     crop_image=query_crop_image,
-                    top_k=5,
+                    top_k=num_cameras * 4,
                     score_threshold=threshold,
-                    ambiguity_margin=config.AMBIGUITY_THRESHOLD
+                    ambiguity_margin=config.AMBIGUITY_THRESHOLD,
+                    camera_filter=camera_filter if camera_filter else None
                 )
 
             decision = query_result["decision"]
@@ -272,14 +282,39 @@ if workflow_mode == "Query by Image":
             else:
                 st.info("Visual evidence generation is withheld when match confidence is insufficient or Unknown.")
 
-            # Top Candidates Comparison Table
+            # ── Per-Camera Best Match Panel ──────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 📷 Best Match Per Camera")
+            per_camera_best = query_result.get("per_camera_best", {})
+            cam_ids = list(config.CAMERA_VIDEOS.keys())
+            pcam_cols = st.columns(len(cam_ids))
+            for col_idx, cam_id in enumerate(cam_ids):
+                with pcam_cols[col_idx]:
+                    is_top = (top_cand and top_cand.get("camera_id") == cam_id)
+                    header = f"{'⭐ ' if is_top else ''}**{cam_id}**"
+                    st.markdown(header)
+                    if cam_id in per_camera_best:
+                        best = per_camera_best[cam_id]
+                        crop_p = best["representative_crop_path"]
+                        if os.path.exists(crop_p):
+                            st.image(crop_p, use_container_width=True)
+                        score_color = "🟢" if best["score"] >= threshold else "🔴"
+                        st.caption(f"{score_color} Score: **{best['score']:.4f}**")
+                        st.caption(f"Track: `{best['track_id']}`")
+                        st.caption(f"Identity: `{best['identity_label']}`")
+                        st.caption(f"{format_timestamp(best['start_time'])} → {format_timestamp(best['end_time'])}")
+                    else:
+                        st.caption("_No tracks found_")
+
+            # ── Top Global Candidates Table ──────────────────────────────────
             st.markdown("---")
             st.markdown("### Candidate Tracks Comparison (Top Hits)")
             candidates = query_result.get("candidates", [])
+            display_top_n = min(len(candidates), num_cameras * 2)
             if candidates:
-                cand_cols = st.columns(len(candidates))
-                for i, c in enumerate(candidates):
-                    with cand_cols[i]:
+                cand_cols = st.columns(min(display_top_n, 5))
+                for i, c in enumerate(candidates[:display_top_n]):
+                    with cand_cols[i % 5]:
                         crop_p = c["representative_crop_path"]
                         if os.path.exists(crop_p):
                             st.image(crop_p, use_container_width=True)
@@ -381,7 +416,7 @@ elif workflow_mode == "Upload Video / Register Identities":
                     else:
                         # All other cameras: auto-match against registry or create new identity
                         if st.button("Match / Register Track", key=f"btn_{track['track_id']}"):
-                            res = registry.register_camera2_track(
+                            res = registry.register_secondary_track(
                                 track,
                                 match_threshold=config.DEFAULT_MATCH_THRESHOLD,
                                 ambiguity_margin=config.AMBIGUITY_THRESHOLD

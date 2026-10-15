@@ -76,23 +76,60 @@ class ScreenshotMatcher:
 
         return candidate_crops
 
+    def _format_hit(self, hit: Dict[str, Any]) -> Dict[str, Any]:
+        """Formats a raw Qdrant hit into a candidate info dict."""
+        payload = hit["payload"]
+        t_id = payload["track_id"]
+        reg_status, assigned_id = self.registry.is_track_registered(t_id)
+        return {
+            "track_id": t_id,
+            "camera_id": payload["camera_id"],
+            "score": round(hit["score"], 4),
+            "identity_label": assigned_id if reg_status else "Unregistered",
+            "start_time": payload["start_time"],
+            "end_time": payload["end_time"],
+            "duration": payload["duration"],
+            "representative_crop_path": payload["representative_crop_path"],
+            "source_video_path": payload["source_video_path"]
+        }
+
     def query_crop(
         self,
         crop_image: np.ndarray,
         top_k: int = 5,
         score_threshold: float = config.DEFAULT_MATCH_THRESHOLD,
-        ambiguity_margin: float = config.AMBIGUITY_THRESHOLD
+        ambiguity_margin: float = config.AMBIGUITY_THRESHOLD,
+        camera_filter: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Executes query for a single person crop against Qdrant.
+        Executes query for a single person crop against Qdrant across all cameras.
+
+        Strategy:
+        1. Fetch a large pool (top_k * num_cameras) so no camera is squeezed out.
+        2. Guarantee one best-match per camera (per_camera_best) for the UI panel.
+        3. Merge global top-k + per-camera bests (deduplicated) for the candidates table.
+        4. Use the global top-1 for the CONFIRMED/AMBIGUOUS/UNKNOWN decision.
         """
+        num_cameras = len(config.CAMERA_VIDEOS)
+
         # 1. Extract 512-dim embedding
         query_vector = self.extractor.extract_features(crop_image)
 
-        # 2. Query Qdrant for top candidates
-        qdrant_hits = self.qstore.search_similar(query_vector=query_vector, limit=top_k)
+        # 2. Fetch a large pool to guarantee per-camera coverage
+        fetch_limit = max(top_k * num_cameras, 20)
+        raw_hits = self.qstore.search_similar(
+            query_vector=query_vector,
+            limit=fetch_limit,
+            camera_id=None  # Always search all cameras at this stage
+        )
 
-        if not qdrant_hits:
+        # Apply optional camera filter AFTER fetching (preserves per_camera_best for full map)
+        if camera_filter:
+            filtered_hits = [h for h in raw_hits if h["payload"]["camera_id"] in camera_filter]
+        else:
+            filtered_hits = raw_hits
+
+        if not filtered_hits:
             return {
                 "decision": "UNKNOWN",
                 "matched_track_id": None,
@@ -101,51 +138,73 @@ class ScreenshotMatcher:
                 "match_score": 0.0,
                 "margin": 0.0,
                 "candidates": [],
+                "per_camera_best": {},
                 "message": "No candidates found in Qdrant database."
             }
 
-        # 3. Analyze top candidates
-        top1 = qdrant_hits[0]
+        # 3. Build per-camera best-match map from the full unfiltered pool
+        per_camera_best: Dict[str, Dict[str, Any]] = {}
+        for hit in raw_hits:
+            cam = hit["payload"]["camera_id"]
+            if cam not in per_camera_best:
+                per_camera_best[cam] = self._format_hit(hit)
+
+        # 4. Global top-k from filtered hits
+        global_top = filtered_hits[:top_k]
+
+        # 5. Analyze global top-1 for decision
+        top1 = global_top[0]
         top1_score = top1["score"]
-        top2_score = qdrant_hits[1]["score"] if len(qdrant_hits) > 1 else 0.0
+        top2_score = global_top[1]["score"] if len(global_top) > 1 else 0.0
         margin = top1_score - top2_score
 
-        # Check registered identity
+        # Check registered identity for top-1
         is_reg, id_label = self.registry.is_track_registered(top1["payload"]["track_id"])
         identity_display = id_label if is_reg else "Unregistered Person"
 
-        # 4. Apply decision logic
+        # 6. Apply decision logic
         if top1_score >= score_threshold:
             if margin >= ambiguity_margin:
                 decision = "CONFIRMED_MATCH"
-                msg = f"Confident match with track {top1['payload']['track_id']} ({identity_display}) at similarity {top1_score:.3f} (margin: {margin:.3f})."
+                msg = (
+                    f"Confident match with track {top1['payload']['track_id']} "
+                    f"({identity_display}) at similarity {top1_score:.3f} (margin: {margin:.3f})."
+                )
             else:
                 decision = "AMBIGUOUS"
                 identity_display = "Unknown (Ambiguous Candidate)"
-                msg = f"Match candidate {top1['payload']['track_id']} exceeded threshold ({top1_score:.3f}), but top-2 margin ({margin:.3f}) is below ambiguity threshold ({ambiguity_margin:.2f})."
+                msg = (
+                    f"Match candidate {top1['payload']['track_id']} exceeded threshold "
+                    f"({top1_score:.3f}), but top-2 margin ({margin:.3f}) is below "
+                    f"ambiguity threshold ({ambiguity_margin:.2f})."
+                )
         else:
             decision = "UNKNOWN"
             identity_display = "Unknown"
-            msg = f"Similarity score ({top1_score:.3f}) is below confidence threshold ({score_threshold:.2f}). Reported as Unknown."
+            msg = (
+                f"Similarity score ({top1_score:.3f}) is below confidence threshold "
+                f"({score_threshold:.2f}). Reported as Unknown."
+            )
 
-        # Format candidates list
+        # 7. Merge global top-k + per-camera bests (deduplicated, sorted by score)
+        seen_track_ids = set()
         candidates_info = []
-        for hit in qdrant_hits:
-            payload = hit["payload"]
-            t_id = payload["track_id"]
-            reg_status, assigned_id = self.registry.is_track_registered(t_id)
+        for hit in global_top:
+            fmt = self._format_hit(hit)
+            if fmt["track_id"] not in seen_track_ids:
+                seen_track_ids.add(fmt["track_id"])
+                candidates_info.append(fmt)
 
-            candidates_info.append({
-                "track_id": t_id,
-                "camera_id": payload["camera_id"],
-                "score": round(hit["score"], 4),
-                "identity_label": assigned_id if reg_status else "Unregistered",
-                "start_time": payload["start_time"],
-                "end_time": payload["end_time"],
-                "duration": payload["duration"],
-                "representative_crop_path": payload["representative_crop_path"],
-                "source_video_path": payload["source_video_path"]
-            })
+        # Inject per-camera bests not already in global top-k
+        for cam_id in config.CAMERA_VIDEOS.keys():
+            if cam_id in per_camera_best:
+                best = per_camera_best[cam_id]
+                if best["track_id"] not in seen_track_ids:
+                    seen_track_ids.add(best["track_id"])
+                    candidates_info.append(best)
+
+        # Sort merged list by score descending
+        candidates_info.sort(key=lambda c: c["score"], reverse=True)
 
         return {
             "decision": decision,
@@ -156,5 +215,7 @@ class ScreenshotMatcher:
             "margin": round(margin, 4),
             "top_candidate": candidates_info[0],
             "candidates": candidates_info,
+            "per_camera_best": per_camera_best,
             "message": msg
         }
+

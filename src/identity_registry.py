@@ -172,18 +172,18 @@ class IdentityRegistry:
         candidates.sort(key=lambda c: c["best_score"], reverse=True)
         return candidates
 
-    def register_camera2_track(
+    def register_secondary_track(
         self,
         track_info: Dict[str, Any],
         match_threshold: float = config.DEFAULT_MATCH_THRESHOLD,
         ambiguity_margin: float = config.AMBIGUITY_THRESHOLD
     ) -> Dict[str, Any]:
         """
-        Registers a Camera 2 track:
+        Registers a track from any non-primary camera (Camera_2, Camera_3, Camera_4, etc.):
         1. Checks if already registered (idempotency).
         2. Compares against all registered identities in resources.json.
         3. If top match passes threshold and ambiguity margin:
-           Appends reference to the existing identity.
+           Appends reference to the existing identity (confirmed cross-camera match).
         4. Otherwise:
            Creates a new unique identity record (e.g. Person_B).
         """
