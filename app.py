@@ -216,6 +216,9 @@ if workflow_mode == "Query by Image":
             run_query = st.button("🔍 Search Person in Qdrant", type="primary")
 
         num_cameras = len(config.CAMERA_VIDEOS)
+        if "query_result" not in st.session_state:
+            st.session_state["query_result"] = None
+
         if run_query:
             with st.spinner("Extracting OSNet 512-dim embedding and querying Qdrant..."):
                 query_result = matcher.query_crop(
@@ -225,16 +228,22 @@ if workflow_mode == "Query by Image":
                     ambiguity_margin=config.AMBIGUITY_THRESHOLD,
                     camera_filter=camera_filter if camera_filter else None
                 )
+                st.session_state["query_result"] = query_result
+        else:
+            query_result = st.session_state.get("query_result")
 
+        if query_result:
             decision = query_result["decision"]
             match_score = query_result["match_score"]
             margin = query_result["margin"]
             top_cand = query_result["top_candidate"]
+            per_camera_best = query_result.get("per_camera_best", {})
+            active_cameras = [c for c in (camera_filter if camera_filter else config.CAMERA_VIDEOS.keys()) if c in per_camera_best]
 
             # Display Matching Decision Banner
             st.markdown("### Matching Decision")
             if decision == "CONFIRMED_MATCH":
-                st.markdown(f'<div class="badge-confirmed">✔ CONFIRMED MATCH: {query_result["identity_label"]} (Score: {match_score:.3f}, Margin: {margin:.3f})</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="badge-confirmed">✔ CONFIRMED MATCH: {query_result["identity_label"]} (Top Score: {match_score:.3f}, Margin: {margin:.3f})</div>', unsafe_allow_html=True)
                 st.success(query_result["message"])
             elif decision == "AMBIGUOUS":
                 st.markdown(f'<div class="badge-ambiguous">⚠ AMBIGUOUS CANDIDATES (Top Score: {match_score:.3f}, Margin: {margin:.3f})</div>', unsafe_allow_html=True)
@@ -243,42 +252,118 @@ if workflow_mode == "Query by Image":
                 st.markdown(f'<div class="badge-unknown">✖ UNKNOWN (Similarity: {match_score:.3f} < {threshold:.2f})</div>', unsafe_allow_html=True)
                 st.error(query_result["message"])
 
-            # Metric details
+            # Metric details (Summary across cameras)
             if top_cand:
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Camera ID", top_cand["camera_id"])
-                m2.metric("Track ID", top_cand["track_id"])
-                m3.metric("Time Range", f"{format_timestamp(top_cand['start_time'])} -> {format_timestamp(top_cand['end_time'])}")
-                m4.metric("Duration", f"{top_cand['duration']}s")
+                m1.metric("Top Match Camera", top_cand["camera_id"])
+                m2.metric("Top Track ID", top_cand["track_id"])
+                m3.metric("Top Score", f"{match_score:.4f}")
+                m4.metric("Cameras Matched", f"{len(active_cameras)} / {len(config.CAMERA_VIDEOS)}")
 
-            # Visual Evidence Generation
+            # Visual Evidence Generation across ALL cameras
             st.markdown("---")
-            st.markdown("### 🎬 Video Evidence with Green Bounding Boxes")
-            
-            if top_cand and decision != "UNKNOWN":
-                with st.spinner(f"Generating annotated video evidence for {top_cand['track_id']}..."):
-                    gen = get_evidence_generator()
-                    ev_data = gen.generate_annotated_evidence(
-                        track_id=top_cand["track_id"],
-                        display_label=f"{query_result['identity_label']} ({top_cand['track_id']})",
-                        max_frames_to_render=90
-                    )
+            st.markdown("### 🎬 Video Evidence with Green Bounding Boxes (All Cameras)")
+            st.caption(f"Displaying target tracking evidence across all {len(active_cameras)} cameras with green bounding boxes.")
 
-                col_v, col_kf = st.columns([3, 2])
-                with col_v:
-                    st.markdown("**Playable Evidence Video Clip:**")
-                    ev_video_path = ev_data["evidence_video_path"]
-                    if os.path.exists(ev_video_path):
-                        st.video(ev_video_path)
-                    else:
-                        st.error("Evidence video file could not be opened.")
+            if active_cameras and decision != "UNKNOWN":
+                gen = get_evidence_generator()
+                camera_evidence = {}
 
-                with col_kf:
-                    st.markdown("**Keyframe Snapshots (Green Boxes):**")
-                    keyframes = ev_data.get("keyframes", [])
-                    for kf in keyframes[:3]:
-                        if os.path.exists(kf["image_path"]):
-                            st.image(kf["image_path"], caption=f"Time: {format_timestamp(kf['timestamp'])}", use_container_width=True)
+                with st.spinner(f"Generating / loading annotated video evidence for all {len(active_cameras)} cameras..."):
+                    for cam_id in active_cameras:
+                        cand = per_camera_best[cam_id]
+                        t_id = cand["track_id"]
+                        try:
+                            ev = gen.generate_annotated_evidence(
+                                track_id=t_id,
+                                display_label=f"{cand['identity_label'] if cand['identity_label'] != 'Unregistered' else query_result['identity_label']} ({t_id})",
+                                max_frames_to_render=90
+                            )
+                            camera_evidence[cam_id] = {
+                                "candidate": cand,
+                                "evidence": ev
+                            }
+                        except Exception as e:
+                            st.error(f"Error loading evidence for {cam_id} ({t_id}): {e}")
+
+                # Create tabs for Multi-Camera Grid plus individual camera inspection
+                tab_titles = ["📺 All Cameras (Multi-Camera Grid)"] + [
+                    f"{'⭐ ' if cam == top_cand.get('camera_id') else ''}{cam} ({per_camera_best[cam]['score']:.3f})"
+                    for cam in active_cameras
+                ]
+                tabs = st.tabs(tab_titles)
+
+                # Tab 0: All Cameras Side-by-Side (2x2 Grid)
+                with tabs[0]:
+                    st.markdown("#### Synchronized Multi-Camera Video Evidence Grid")
+                    grid_cols = st.columns(2)
+                    for idx, cam_id in enumerate(active_cameras):
+                        data = camera_evidence.get(cam_id)
+                        if not data:
+                            continue
+                        cand = data["candidate"]
+                        ev = data["evidence"]
+                        is_top = (top_cand and top_cand.get("camera_id") == cam_id)
+
+                        with grid_cols[idx % 2]:
+                            st.markdown(
+                                f"**{'⭐ ' if is_top else ''}{cam_id}** — "
+                                f"`{cand['track_id']}` | Score: **{cand['score']:.4f}** "
+                                f"{'🟢' if cand['score'] >= threshold else '🔴'}"
+                            )
+                            st.caption(f"⏱ Time: {format_timestamp(cand['start_time'])} → {format_timestamp(cand['end_time'])} ({cand['duration']}s)")
+
+                            ev_path = ev["evidence_video_path"]
+                            if os.path.exists(ev_path):
+                                with open(ev_path, "rb") as vf:
+                                    st.video(vf.read(), format="video/mp4")
+                            else:
+                                st.error(f"Evidence video file missing for {cam_id}")
+
+                            # Show keyframe thumbnails below video
+                            kfs = ev.get("keyframes", [])
+                            if kfs:
+                                kf_cols = st.columns(min(len(kfs), 3))
+                                for k_idx, kf in enumerate(kfs[:3]):
+                                    with kf_cols[k_idx]:
+                                        if os.path.exists(kf["image_path"]):
+                                            st.image(kf["image_path"], caption=f"{format_timestamp(kf['timestamp'])}", use_container_width=True)
+                            st.markdown("---")
+
+                # Tabs 1..N: Individual Camera Detailed Views
+                for idx, cam_id in enumerate(active_cameras):
+                    with tabs[idx + 1]:
+                        data = camera_evidence.get(cam_id)
+                        if not data:
+                            st.warning(f"No evidence data found for {cam_id}")
+                            continue
+                        cand = data["candidate"]
+                        ev = data["evidence"]
+                        is_top = (top_cand and top_cand.get("camera_id") == cam_id)
+
+                        st.markdown(f"#### {'⭐ Top Match: ' if is_top else ''}{cam_id} Evidence Inspection")
+                        c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+                        c_m1.metric("Camera ID", cam_id)
+                        c_m2.metric("Track ID", cand["track_id"])
+                        c_m3.metric("Similarity Score", f"{cand['score']:.4f}")
+                        c_m4.metric("Time Observed", f"{format_timestamp(cand['start_time'])} → {format_timestamp(cand['end_time'])} ({cand['duration']}s)")
+
+                        col_v, col_kf = st.columns([3, 2])
+                        with col_v:
+                            st.markdown(f"**Playable Video Clip ({cam_id}):**")
+                            ev_path = ev["evidence_video_path"]
+                            if os.path.exists(ev_path):
+                                with open(ev_path, "rb") as vf:
+                                    st.video(vf.read(), format="video/mp4")
+                            else:
+                                st.error("Evidence video file could not be opened.")
+
+                        with col_kf:
+                            st.markdown(f"**Keyframe Snapshots with Green Bounding Boxes ({cam_id}):**")
+                            keyframes = ev.get("keyframes", [])
+                            for kf in keyframes[:3]:
+                                if os.path.exists(kf["image_path"]):
+                                    st.image(kf["image_path"], caption=f"Timestamp: {format_timestamp(kf['timestamp'])}", use_container_width=True)
             else:
                 st.info("Visual evidence generation is withheld when match confidence is insufficient or Unknown.")
 
